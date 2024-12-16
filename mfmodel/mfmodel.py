@@ -45,8 +45,7 @@ class MFModel:
         self.H = None
 
     def fit(self, Y, max_iter=100, tol=1e-6, verbose=False, return_losses=False):
-        """
-        Fit the model using EM algorithm as specified in the paper.
+        """Fit the model using EM algorithm as specified in Section 3 of the paper.
         
         Args:
             Y: Observed data matrix (n x p) where n is number of features and p is number of samples
@@ -54,12 +53,6 @@ class MFModel:
             tol: Convergence tolerance for log-likelihood
             verbose: Whether to print progress
             return_losses: Whether to return list of log-likelihood values
-            
-        Returns:
-            If return_losses is False:
-                converged: Whether the algorithm converged
-            If return_losses is True:
-                (converged, losses): Convergence status and list of log-likelihood values
         """
         if Y is None:
             raise ValueError("Input data Y is required")
@@ -113,16 +106,13 @@ class MFModel:
                             D_inv_block = 1.0 / (self.D[r1:r2] + eps)  # n_block
                             
                             # Compute E[Z|Y] and E[ZZ^T|Y] as in paper
-                            # E[Z|Y] = (I + F^T D^{-1} F)^{-1} F^T D^{-1} Y
                             FtDinv = F_block.T * D_inv_block[None, :]  # rank x n_block
                             M = np.eye(rank) + FtDinv @ F_block  # rank x rank
                             
                             try:
                                 # Use Cholesky for better numerical stability
                                 L = np.linalg.cholesky(M + eps * np.eye(rank))
-                                # E[Z|Y] = L^{-T} L^{-1} F^T D^{-1} Y
                                 EZ = np.linalg.solve(L.T, np.linalg.solve(L, FtDinv @ Y_block))
-                                # E[ZZ^T|Y] = p * L^{-T} L^{-1} + E[Z|Y]E[Z|Y]^T
                                 EZZt = Y_block.shape[1] * np.linalg.solve(L.T, np.linalg.solve(L, np.eye(rank))) + EZ @ EZ.T
                             except np.linalg.LinAlgError:
                                 # Fallback to eigendecomposition
@@ -132,7 +122,6 @@ class MFModel:
                                 EZZt = Y_block.shape[1] * sqrt_inv @ sqrt_inv + EZ @ EZ.T
                             
                             # M-step: Update F and D using sufficient statistics
-                            # Update F: F = YE[Z^T](E[ZZ^T])^{-1}
                             try:
                                 F_new = Y_block @ EZ.T @ np.linalg.inv(EZZt + eps * np.eye(rank))
                                 self.F[r1:r2, start_rank:start_rank+rank] = F_new
@@ -480,108 +469,117 @@ class MFModel:
 
         return res
 
-    def fast_frob_fit_loglikehood(self, A, Y, F_hpart, hpart, ranks, printing=False, eps_ff=1e-3):
-        """
-        Fast Frobenius norm fitting with efficient log-likelihood computation using MLR structure.
-        
-        Args:
-            A: Sample covariance matrix
-            Y: Data matrix
-            F_hpart: Factor hierarchical partition
-            hpart: Full hierarchical partition
-            ranks: Rank allocation for each level
-            printing: Whether to print progress
-            eps_ff: Convergence tolerance
-            
-        Returns:
-            fitted_mfm: Fitted model
-            losses: Loss history
-        """
+    def fast_frob_fit_loglikehood(self, A, Y, F_hpart, hpart, ranks, max_iter=100, tol=1e-6, printing=False):
+        """Efficient Frobenius norm fitting implementation using block-wise operations."""
         n = A.shape[0]
         total_rank = sum(ranks)
-        
-        # Initialize model with MLR structure
-        fitted_mfm = MFModel(F=None, D=None, hpart=F_hpart, ranks=ranks)
-        fitted_mfm.n_features = n
-        fitted_mfm.total_rank = total_rank
-        
-        # Initialize parameters using block structure
-        F = np.zeros((n, total_rank))
-        D = np.diag(A).copy()
-        
-        # Precompute sparsity patterns for efficient computation
-        si_groups = []
-        row_selectors = []
-        for level, lk in enumerate(hpart["rows"]["lk"]):
-            for i in range(len(lk)-1):
-                si_groups.append((level, i))
-                row_selectors.append(lk[i])
-        row_selectors.append(lk[-1])
-        row_selectors = np.array(row_selectors)
-        
-        # Initialize loss tracking
         losses = []
-        old_loss = np.inf
         
-        for iter in range(300):  # Max iterations as in paper
-            # Update F using block structure and MLR operations
+        # Initialize model if not already done
+        if self.F is None:
+            self.F = np.zeros((n, total_rank))
+        if self.D is None:
+            self.D = np.diag(A).copy()
+        
+        # Get level partitions
+        if "lk" in hpart:
+            lk = hpart["lk"]
+        else:
+            lk = hpart["rows"]["lk"]
+        
+        # Pre-compute block indices for efficiency
+        block_indices = []
+        for level in range(len(lk)):
+            level_blocks = []
+            for i in range(len(lk[level])-1):
+                r1, r2 = lk[level][i], lk[level][i+1]
+                if r2 > r1:
+                    level_blocks.append((r1, r2))
+            block_indices.append(level_blocks)
+        
+        # Main optimization loop
+        prev_loss = np.inf
+        for iteration in range(max_iter):
+            # 1. Update F level by level using block operations
             start_rank = 0
             for level, rank in enumerate(ranks):
-                lk = hpart["rows"]["lk"][level]
-                for i in range(len(lk)-1):
-                    r1, r2 = lk[i], lk[i+1]
-                    block = A[r1:r2, r1:r2]
+                if rank == 0 or level >= len(lk):
+                    continue
+                
+                for r1, r2 in block_indices[level]:
+                    block_size = r2 - r1
                     
-                    # Efficient block update using SVD
+                    # Extract relevant blocks
+                    A_block = A[r1:r2, r1:r2]
+                    D_block = np.diag(self.D[r1:r2])
+                    
+                    # Compute block update efficiently
                     try:
-                        U, s, Vt = np.linalg.svd(block, full_matrices=False)
-                        F[r1:r2, start_rank:start_rank+rank] = U[:, :rank] * np.sqrt(np.maximum(s[:rank], eps_ff))[np.newaxis, :]
+                        # Use eigendecomposition for better numerical stability
+                        eigvals, eigvecs = np.linalg.eigh(A_block - D_block)
+                        # Sort eigenvalues in descending order
+                        idx = np.argsort(eigvals)[::-1]
+                        eigvals = eigvals[idx]
+                        eigvecs = eigvecs[:, idx]
+                        
+                        # Take top rank eigenvalues/vectors and ensure proper broadcasting
+                        top_eigvals = np.maximum(eigvals[:rank], 0)
+                        top_eigvecs = eigvecs[:, :rank]
+                        scaling = np.sqrt(top_eigvals).reshape(1, -1)
+                        
+                        # Update F block with proper broadcasting
+                        self.F[r1:r2, start_rank:start_rank+rank] = top_eigvecs * scaling
+                        
                     except np.linalg.LinAlgError:
-                        # Fallback for numerical stability
-                        U, s, Vt = np.linalg.svd(block + eps_ff * np.eye(r2-r1), full_matrices=False)
-                        F[r1:r2, start_rank:start_rank+rank] = U[:, :rank] * np.sqrt(s[:rank])[np.newaxis, :]
+                        # Fallback to SVD if eigendecomposition fails
+                        try:
+                            U, s, _ = np.linalg.svd(A_block - D_block, full_matrices=False)
+                            scaling = np.sqrt(np.maximum(s[:rank], 0)).reshape(1, -1)
+                            self.F[r1:r2, start_rank:start_rank+rank] = U[:, :rank] * scaling
+                        except np.linalg.LinAlgError:
+                            # If SVD also fails, use random initialization
+                            self.F[r1:r2, start_rank:start_rank+rank] = np.random.randn(block_size, rank) * np.sqrt(0.1)
                 
                 start_rank += rank
             
-            # Efficient computation of F @ F.T using MLR structure
-            FFt = np.zeros_like(A)
-            for si in range(len(si_groups)):
-                level, block_idx = si_groups[si]
-                r1, r2 = row_selectors[si], row_selectors[si+1]
-                rank_start = sum(ranks[:level])
-                rank_end = rank_start + ranks[level]
-                F_block = F[r1:r2, rank_start:rank_end]
-                FFt[r1:r2, r1:r2] = F_block @ F_block.T
+            # 2. Update D efficiently using vectorized operations
+            FFt_diag = np.sum(self.F * self.F, axis=1)
+            self.D = np.maximum(np.diag(A) - FFt_diag, self.eps)
             
-            # Update D ensuring positivity
-            D = np.maximum(np.diag(A - FFt), eps_ff)
+            # 3. Compute loss efficiently using block structure
+            loss = 0.0
+            start_rank = 0
+            for level, rank in enumerate(ranks):
+                if rank == 0 or level >= len(lk):
+                    continue
+                    
+                for r1, r2 in block_indices[level]:
+                    # Compute block contribution to loss
+                    F_block = self.F[r1:r2, start_rank:start_rank+rank]
+                    A_block = A[r1:r2, r1:r2]
+                    D_block = np.diag(self.D[r1:r2])
+                    
+                    # Efficient block loss computation
+                    block_diff = A_block - (F_block @ F_block.T + D_block)
+                    loss += np.sum(block_diff * block_diff)
+                
+                start_rank += rank
             
-            # Compute loss efficiently using block structure
-            loss = 0
-            for si in range(len(si_groups)):
-                level, block_idx = si_groups[si]
-                r1, r2 = row_selectors[si], row_selectors[si+1]
-                block_diff = A[r1:r2, r1:r2] - FFt[r1:r2, r1:r2] - np.diag(D[r1:r2])
-                loss += np.sum(block_diff**2)
+            current_loss = 0.5 * loss
+            losses.append(current_loss)
             
-            losses.append(loss)
-            
-            if printing and iter % 50 == 0:
-                print(f"Iteration {iter}: loss = {loss:.6f}")
+            if printing:
+                print(f"Iteration {iteration + 1}, Loss: {current_loss:.4f}")
             
             # Check convergence
-            if abs(loss - old_loss) < eps_ff * abs(old_loss):
+            if abs(current_loss - prev_loss) < tol * abs(prev_loss):
                 if printing:
-                    print(f"Converged after {iter+1} iterations")
+                    print(f"Converged after {iteration + 1} iterations")
                 break
-            
-            old_loss = loss
+                
+            prev_loss = current_loss
         
-        # Set final parameters
-        fitted_mfm.F = F
-        fitted_mfm.D = D
-        
-        return fitted_mfm, losses
+        return self, losses
 
     def fast_exp_loglikelihood_value(self, true_params, ranks, hpart_rows, row_selectors, si_groups):
         """Compute expected log-likelihood value efficiently."""
@@ -638,8 +636,7 @@ class MFModel:
         return ll / n  # Normalize by dimension as in paper
 
     def _initialize_parameters(self, Y):
-        """
-        Initialize model parameters following the paper's approach.
+        """Initialize model parameters following Section 5's approach.
         Uses block-wise SVD initialization for F and residual-based initialization for D.
         """
         n = Y.shape[0]  # n features (after transpose)
@@ -657,7 +654,7 @@ class MFModel:
         else:
             lk = self.hpart["rows"]["lk"]
         
-        # Initialize each level separately
+        # Initialize each level separately as described in Section 5
         for level, rank in enumerate(self.ranks):
             if rank == 0 or level >= len(lk):
                 continue
